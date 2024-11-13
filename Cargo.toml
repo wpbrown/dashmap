@@ -1,5 +1,5 @@
 [package]
-name = "dashmap"
+name = "dashmap_aspec"
 version = "6.1.0"
 authors = ["Acrimon <joel.wejdenstal@gmail.com>"]
 edition = "2018"
@@ -19,9 +19,10 @@ typesize = ["dep:typesize"]
 inline = ["hashbrown/inline-more"]
 
 [dependencies]
+allocator-api2 = "0.2.18"
 lock_api = "0.4.10"
 parking_lot_core = "0.9.8"
-hashbrown = { version = "0.14.0", default-features = false, features = ["raw"] }
+hashbrown = { version = "0.14.0", default-features = false, features = ["raw", "allocator-api2"] }
 serde = { version = "1.0.188", optional = true, features = ["derive"] }
 cfg-if = "1.0.0"
 rayon = { version = "1.7.0", optional = true }

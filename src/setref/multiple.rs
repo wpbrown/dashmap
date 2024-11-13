@@ -1,13 +1,15 @@
+use allocator_api2::alloc::Global;
+
 use crate::mapref;
 use core::hash::Hash;
 use core::ops::Deref;
 
 pub struct RefMulti<'a, K> {
-    inner: mapref::multiple::RefMulti<'a, K, ()>,
+    inner: mapref::multiple::RefMulti<'a, K, (), Global>,
 }
 
 impl<'a, K: Eq + Hash> RefMulti<'a, K> {
-    pub(crate) fn new(inner: mapref::multiple::RefMulti<'a, K, ()>) -> Self {
+    pub(crate) fn new(inner: mapref::multiple::RefMulti<'a, K, (), Global>) -> Self {
         Self { inner }
     }
 

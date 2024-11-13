@@ -28,6 +28,7 @@ use crate::lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(feature = "raw-api")]
 pub use crate::lock::{RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use allocator_api2::alloc::{Allocator, Global};
 use cfg_if::cfg_if;
 use core::borrow::Borrow;
 use core::fmt;
@@ -54,7 +55,7 @@ cfg_if! {
     }
 }
 
-pub(crate) type HashMap<K, V> = hashbrown::raw::RawTable<(K, SharedValue<V>)>;
+pub(crate) type HashMap<K, V, A> = hashbrown::raw::RawTable<(K, SharedValue<V>), A>;
 
 // Temporary reimplementation of [`std::collections::TryReserveError`]
 // util [`std::collections::TryReserveError`] stabilises.
@@ -80,21 +81,22 @@ fn ncb(shard_amount: usize) -> usize {
 /// DashMap tries to implement an easy to use API similar to `std::collections::HashMap`
 /// with some slight changes to handle concurrency.
 ///
-/// DashMap tries to be very simple to use and to be a direct replacement for `RwLock<HashMap<K, V>>`.
+/// DashMap tries to be very simple to use and to be a direct replacement for `RwLock<HashMap<K, V, A>>`.
 /// To accomplish this, all methods take `&self` instead of modifying methods taking `&mut self`.
 /// This allows you to put a DashMap in an `Arc<T>` and share it between threads while being able to modify it.
 ///
 /// Documentation mentioning locking behaviour acts in the reference frame of the calling thread.
 /// This means that it is safe to ignore it across multiple threads.
-pub struct DashMap<K, V, S = RandomState> {
+pub struct DashMap<K, V, S = RandomState, A: Allocator = Global> {
+    allocator: A,
     shift: usize,
-    shards: Box<[CachePadded<RwLock<HashMap<K, V>>>]>,
+    shards: allocator_api2::boxed::Box<[CachePadded<RwLock<HashMap<K, V, A>>>], A>,
     hasher: S,
 }
 
 impl<K: Eq + Hash + Clone, V: Clone, S: Clone> Clone for DashMap<K, V, S> {
     fn clone(&self) -> Self {
-        let mut inner_shards = Vec::new();
+        let mut inner_shards = allocator_api2::vec::Vec::new();
 
         for shard in self.shards.iter() {
             let shard = shard.read();
@@ -103,6 +105,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: Clone> Clone for DashMap<K, V, S> {
         }
 
         Self {
+            allocator: self.allocator,
             shift: self.shift,
             shards: inner_shards.into_boxed_slice(),
             hasher: self.hasher.clone(),
@@ -110,13 +113,14 @@ impl<K: Eq + Hash + Clone, V: Clone, S: Clone> Clone for DashMap<K, V, S> {
     }
 }
 
-impl<K, V, S> Default for DashMap<K, V, S>
+impl<K, V, S, A> Default for DashMap<K, V, S, A>
 where
     K: Eq + Hash,
     S: Default + BuildHasher + Clone,
+    A: Allocator + Copy + Default,
 {
     fn default() -> Self {
-        Self::with_hasher(Default::default())
+        Self::with_hasher_in(Default::default(), Default::default())
     }
 }
 
@@ -191,12 +195,60 @@ impl<'a, K: 'a + Eq + Hash, V: 'a> DashMap<K, V, RandomState> {
     }
 }
 
-impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
-    /// Wraps this `DashMap` into a read-only view. This view allows to obtain raw references to the stored values.
-    pub fn into_read_only(self) -> ReadOnlyView<K, V, S> {
-        ReadOnlyView::new(self)
+impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, A: Allocator + Copy>
+    DashMap<K, V, S, A>
+{
+    pub fn with_hasher_in(hasher: S, allocator: A) -> Self {
+        Self::with_capacity_and_hasher_in(0, hasher, allocator)
     }
 
+    pub fn with_capacity_and_hasher_in(capacity: usize, hasher: S, allocator: A) -> Self {
+        Self::with_capacity_and_hasher_and_shard_amount_in(
+            capacity,
+            hasher,
+            default_shard_amount(),
+            allocator,
+        )
+    }
+
+    pub fn with_hasher_and_shard_amount_in(hasher: S, shard_amount: usize, allocator: A) -> Self {
+        Self::with_capacity_and_hasher_and_shard_amount_in(0, hasher, shard_amount, allocator)
+    }
+
+    pub fn with_capacity_and_hasher_and_shard_amount_in(
+        mut capacity: usize,
+        hasher: S,
+        shard_amount: usize,
+        allocator: A,
+    ) -> Self {
+        assert!(shard_amount > 1);
+        assert!(shard_amount.is_power_of_two());
+
+        let shift = util::ptr_size_bits() - ncb(shard_amount);
+
+        if capacity != 0 {
+            capacity = (capacity + (shard_amount - 1)) & !(shard_amount - 1);
+        }
+
+        let cps = capacity / shard_amount;
+
+        let mut shards = allocator_api2::vec::Vec::with_capacity_in(shard_amount, allocator);
+        shards.extend(
+            (0..shard_amount)
+                .map(|_| CachePadded::new(RwLock::new(HashMap::with_capacity_in(cps, allocator)))),
+        );
+        let shards = shards.into_boxed_slice();
+
+        Self {
+            allocator,
+            shift,
+            shards,
+            hasher,
+        }
+    }
+}
+
+impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S, Global> {
     /// Creates a new DashMap with a capacity of 0 and the provided hasher.
     ///
     /// # Examples
@@ -267,30 +319,18 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// mappings.insert(8, 16);
     /// ```
     pub fn with_capacity_and_hasher_and_shard_amount(
-        mut capacity: usize,
+        capacity: usize,
         hasher: S,
         shard_amount: usize,
     ) -> Self {
-        assert!(shard_amount > 1);
-        assert!(shard_amount.is_power_of_two());
+        Self::with_capacity_and_hasher_and_shard_amount_in(capacity, hasher, shard_amount, Global)
+    }
+}
 
-        let shift = util::ptr_size_bits() - ncb(shard_amount);
-
-        if capacity != 0 {
-            capacity = (capacity + (shard_amount - 1)) & !(shard_amount - 1);
-        }
-
-        let cps = capacity / shard_amount;
-
-        let shards = (0..shard_amount)
-            .map(|_| CachePadded::new(RwLock::new(HashMap::with_capacity(cps))))
-            .collect();
-
-        Self {
-            shift,
-            shards,
-            hasher,
-        }
+impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, A: Allocator> DashMap<K, V, S, A> {
+    /// Wraps this `DashMap` into a read-only view. This view allows to obtain raw references to the stored values.
+    pub fn into_read_only(self) -> ReadOnlyView<K, V, S, A> {
+        ReadOnlyView::new(self)
     }
 
     /// Hash a given item to produce a usize.
@@ -322,7 +362,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
             /// let map = DashMap::<(), ()>::new();
             /// println!("Amount of shards: {}", map.shards().len());
             /// ```
-            pub fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V>>>] {
+            pub fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V, A>>>] {
                 &self.shards
             }
 
@@ -351,7 +391,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
             /// map.shards_mut()[shard_ind].get_mut().insert(hash, data, hasher);
             /// assert_eq!(*map.get(&42).unwrap(), "forty two");
             /// ```
-            pub fn shards_mut(&mut self) -> &mut [CachePadded<RwLock<HashMap<K, V>>>] {
+            pub fn shards_mut(&mut self) -> &mut [CachePadded<RwLock<HashMap<K, V, A>>>] {
                 &mut self.shards
             }
 
@@ -361,22 +401,22 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
             /// Requires the `raw-api` feature to be enabled.
             ///
             /// See [`DashMap::shards()`] and [`DashMap::shards_mut()`] for more information.
-            pub fn into_shards(self) -> Box<[CachePadded<RwLock<HashMap<K, V>>>]> {
+            pub fn into_shards(self) -> Box<[CachePadded<RwLock<HashMap<K, V, A>>>]> {
                 self.shards
             }
         } else {
             #[allow(dead_code)]
-            pub(crate) fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V>>>] {
+            pub(crate) fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V, A>>>] {
                 &self.shards
             }
 
             #[allow(dead_code)]
-            pub(crate) fn shards_mut(&mut self) -> &mut [CachePadded<RwLock<HashMap<K, V>>>] {
+            pub(crate) fn shards_mut(&mut self) -> &mut [CachePadded<RwLock<HashMap<K, V, A>>>] {
                 &mut self.shards
             }
 
             #[allow(dead_code)]
-            pub(crate) fn into_shards(self) -> Box<[CachePadded<RwLock<HashMap<K, V>>>]> {
+            pub(crate) fn into_shards(self) -> allocator_api2::boxed::Box<[CachePadded<RwLock<HashMap<K, V, A>>>], A> {
                 self.shards
             }
         }
@@ -544,7 +584,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// words.insert("hello", "world");
     /// assert_eq!(words.iter().count(), 1);
     /// ```
-    pub fn iter(&'a self) -> Iter<'a, K, V, S, DashMap<K, V, S>> {
+    pub fn iter(&'a self) -> Iter<'a, K, V, S, A, DashMap<K, V, S, A>> {
         self._iter()
     }
 
@@ -562,7 +602,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// map.iter_mut().for_each(|mut r| *r += 1);
     /// assert_eq!(*map.get("Johnny").unwrap(), 22);
     /// ```
-    pub fn iter_mut(&'a self) -> IterMut<'a, K, V, S, DashMap<K, V, S>> {
+    pub fn iter_mut(&'a self) -> IterMut<'a, K, V, S, A, DashMap<K, V, S, A>> {
         self._iter_mut()
     }
 
@@ -579,7 +619,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// youtubers.insert("Bosnian Bill", 457000);
     /// assert_eq!(*youtubers.get("Bosnian Bill").unwrap(), 457000);
     /// ```
-    pub fn get<Q>(&'a self, key: &Q) -> Option<Ref<'a, K, V>>
+    pub fn get<Q>(&'a self, key: &Q) -> Option<Ref<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -601,7 +641,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// *class.get_mut("Albin").unwrap() -= 1;
     /// assert_eq!(*class.get("Albin").unwrap(), 14);
     /// ```
-    pub fn get_mut<Q>(&'a self, key: &Q) -> Option<RefMut<'a, K, V>>
+    pub fn get_mut<Q>(&'a self, key: &Q) -> Option<RefMut<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -628,7 +668,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// let result2 = map.try_get("Johnny");
     /// assert!(result2.is_locked());
     /// ```
-    pub fn try_get<Q>(&'a self, key: &Q) -> TryResult<Ref<'a, K, V>>
+    pub fn try_get<Q>(&'a self, key: &Q) -> TryResult<Ref<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -656,7 +696,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// let result2 = map.try_get_mut("Johnny");
     /// assert!(result2.is_locked());
     /// ```
-    pub fn try_get_mut<Q>(&'a self, key: &Q) -> TryResult<RefMut<'a, K, V>>
+    pub fn try_get_mut<Q>(&'a self, key: &Q) -> TryResult<RefMut<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -868,7 +908,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// See the documentation on `dashmap::mapref::entry` for more details.
     ///
     /// **Locking behaviour:** May deadlock if called when holding any sort of reference into the map.
-    pub fn entry(&'a self, key: K) -> Entry<'a, K, V> {
+    pub fn entry(&'a self, key: K) -> Entry<'a, K, V, A> {
         self._entry(key)
     }
 
@@ -876,7 +916,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     /// See the documentation on `dashmap::mapref::entry` for more details.
     ///
     /// Returns None if the shard is currently locked.
-    pub fn try_entry(&'a self, key: K) -> Option<Entry<'a, K, V>> {
+    pub fn try_entry(&'a self, key: K) -> Option<Entry<'a, K, V, A>> {
         self._try_entry(key)
     }
 
@@ -903,26 +943,26 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> DashMap<K, V, S> {
     }
 }
 
-impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
-    for DashMap<K, V, S>
+impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone, A: Allocator> Map<'a, K, V, S, A>
+    for DashMap<K, V, S, A>
 {
     fn _shard_count(&self) -> usize {
         self.shards.len()
     }
 
-    unsafe fn _get_read_shard(&'a self, i: usize) -> &'a HashMap<K, V> {
+    unsafe fn _get_read_shard(&'a self, i: usize) -> &'a HashMap<K, V, A> {
         debug_assert!(i < self.shards.len());
 
         &*self.shards.get_unchecked(i).data_ptr()
     }
 
-    unsafe fn _yield_read_shard(&'a self, i: usize) -> RwLockReadGuard<'a, HashMap<K, V>> {
+    unsafe fn _yield_read_shard(&'a self, i: usize) -> RwLockReadGuard<'a, HashMap<K, V, A>> {
         debug_assert!(i < self.shards.len());
 
         self.shards.get_unchecked(i).read()
     }
 
-    unsafe fn _yield_write_shard(&'a self, i: usize) -> RwLockWriteGuard<'a, HashMap<K, V>> {
+    unsafe fn _yield_write_shard(&'a self, i: usize) -> RwLockWriteGuard<'a, HashMap<K, V, A>> {
         debug_assert!(i < self.shards.len());
 
         self.shards.get_unchecked(i).write()
@@ -931,7 +971,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
     unsafe fn _try_yield_read_shard(
         &'a self,
         i: usize,
-    ) -> Option<RwLockReadGuard<'a, HashMap<K, V>>> {
+    ) -> Option<RwLockReadGuard<'a, HashMap<K, V, A>>> {
         debug_assert!(i < self.shards.len());
 
         self.shards.get_unchecked(i).try_read()
@@ -940,7 +980,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
     unsafe fn _try_yield_write_shard(
         &'a self,
         i: usize,
-    ) -> Option<RwLockWriteGuard<'a, HashMap<K, V>>> {
+    ) -> Option<RwLockWriteGuard<'a, HashMap<K, V, A>>> {
         debug_assert!(i < self.shards.len());
 
         self.shards.get_unchecked(i).try_write()
@@ -1023,15 +1063,15 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
         }
     }
 
-    fn _iter(&'a self) -> Iter<'a, K, V, S, DashMap<K, V, S>> {
+    fn _iter(&'a self) -> Iter<'a, K, V, S, A, DashMap<K, V, S, A>> {
         Iter::new(self)
     }
 
-    fn _iter_mut(&'a self) -> IterMut<'a, K, V, S, DashMap<K, V, S>> {
+    fn _iter_mut(&'a self) -> IterMut<'a, K, V, S, A, DashMap<K, V, S, A>> {
         IterMut::new(self)
     }
 
-    fn _get<Q>(&'a self, key: &Q) -> Option<Ref<'a, K, V>>
+    fn _get<Q>(&'a self, key: &Q) -> Option<Ref<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -1052,7 +1092,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
         }
     }
 
-    fn _get_mut<Q>(&'a self, key: &Q) -> Option<RefMut<'a, K, V>>
+    fn _get_mut<Q>(&'a self, key: &Q) -> Option<RefMut<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -1073,7 +1113,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
         }
     }
 
-    fn _try_get<Q>(&'a self, key: &Q) -> TryResult<Ref<'a, K, V>>
+    fn _try_get<Q>(&'a self, key: &Q) -> TryResult<Ref<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -1097,7 +1137,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
         }
     }
 
-    fn _try_get_mut<Q>(&'a self, key: &Q) -> TryResult<RefMut<'a, K, V>>
+    fn _try_get_mut<Q>(&'a self, key: &Q) -> TryResult<RefMut<'a, K, V, A>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -1182,7 +1222,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
         })
     }
 
-    fn _entry(&'a self, key: K) -> Entry<'a, K, V> {
+    fn _entry(&'a self, key: K) -> Entry<'a, K, V, A> {
         let hash = self.hash_u64(&key);
 
         let idx = self.determine_shard(hash as usize);
@@ -1203,7 +1243,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
         }
     }
 
-    fn _try_entry(&'a self, key: K) -> Option<Entry<'a, K, V>> {
+    fn _try_entry(&'a self, key: K) -> Option<Entry<'a, K, V, A>> {
         let hash = self.hash_u64(&key);
 
         let idx = self.determine_shard(hash as usize);
@@ -1236,8 +1276,8 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> Map<'a, K, V, S>
     }
 }
 
-impl<K: Eq + Hash + fmt::Debug, V: fmt::Debug, S: BuildHasher + Clone> fmt::Debug
-    for DashMap<K, V, S>
+impl<K: Eq + Hash + fmt::Debug, V: fmt::Debug, S: BuildHasher + Clone, A: Allocator> fmt::Debug
+    for DashMap<K, V, S, A>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut pmap = f.debug_map();
@@ -1260,24 +1300,26 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> Shl<(K, V)> for &'a D
     }
 }
 
-impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, Q> Shr<&Q> for &'a DashMap<K, V, S>
+impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, Q, A: Allocator> Shr<&Q>
+    for &'a DashMap<K, V, S, A>
 where
     K: Borrow<Q>,
     Q: Hash + Eq + ?Sized,
 {
-    type Output = Ref<'a, K, V>;
+    type Output = Ref<'a, K, V, A>;
 
     fn shr(self, key: &Q) -> Self::Output {
         self.get(key).unwrap()
     }
 }
 
-impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, Q> BitOr<&Q> for &'a DashMap<K, V, S>
+impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, Q, A: Allocator> BitOr<&Q>
+    for &'a DashMap<K, V, S, A>
 where
     K: Borrow<Q>,
     Q: Hash + Eq + ?Sized,
 {
-    type Output = RefMut<'a, K, V>;
+    type Output = RefMut<'a, K, V, A>;
 
     fn bitor(self, key: &Q) -> Self::Output {
         self.get_mut(key).unwrap()
@@ -1318,10 +1360,12 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> IntoIterator for DashMap<K, V, S> 
     }
 }
 
-impl<'a, K: Eq + Hash, V, S: BuildHasher + Clone> IntoIterator for &'a DashMap<K, V, S> {
-    type Item = RefMulti<'a, K, V>;
+impl<'a, K: Eq + Hash, V, S: BuildHasher + Clone, A: Allocator> IntoIterator
+    for &'a DashMap<K, V, S, A>
+{
+    type Item = RefMulti<'a, K, V, A>;
 
-    type IntoIter = Iter<'a, K, V, S, DashMap<K, V, S>>;
+    type IntoIter = Iter<'a, K, V, S, A, DashMap<K, V, S, A>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -1369,7 +1413,7 @@ where
                     key.extra_size() + value.get().extra_size()
                 });
 
-                core::mem::size_of::<CachePadded<RwLock<HashMap<K, V>>>>()
+                core::mem::size_of::<CachePadded<RwLock<HashMap<K, V, A>>>>()
                     + hashtable_size
                     + entry_size_iter.sum::<usize>()
             })

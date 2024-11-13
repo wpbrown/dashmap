@@ -1,3 +1,5 @@
+use allocator_api2::alloc::{Allocator, Global};
+
 use crate::setref::multiple::RefMulti;
 use crate::t::Map;
 use core::hash::{BuildHasher, Hash};
@@ -34,34 +36,36 @@ where
 {
 }
 
-pub struct Iter<'a, K, S, M> {
-    inner: crate::iter::Iter<'a, K, (), S, M>,
+pub struct Iter<'a, K, S, A: Allocator, M> {
+    inner: crate::iter::Iter<'a, K, (), S, A, M>,
 }
 
-unsafe impl<'a, 'i, K, S, M> Send for Iter<'i, K, S, M>
+unsafe impl<'a, 'i, K, S, A: Allocator, M> Send for Iter<'i, K, S, A, M>
 where
     K: 'a + Eq + Hash + Send,
     S: 'a + BuildHasher + Clone,
-    M: Map<'a, K, (), S>,
+    M: Map<'a, K, (), S, A>,
 {
 }
 
-unsafe impl<'a, 'i, K, S, M> Sync for Iter<'i, K, S, M>
+unsafe impl<'a, 'i, K, S, A: Allocator, M> Sync for Iter<'i, K, S, A, M>
 where
     K: 'a + Eq + Hash + Sync,
     S: 'a + BuildHasher + Clone,
-    M: Map<'a, K, (), S>,
+    M: Map<'a, K, (), S, A>,
 {
 }
 
-impl<'a, K: Eq + Hash, S: 'a + BuildHasher + Clone, M: Map<'a, K, (), S>> Iter<'a, K, S, M> {
-    pub(crate) fn new(inner: crate::iter::Iter<'a, K, (), S, M>) -> Self {
+impl<'a, K: Eq + Hash, S: 'a + BuildHasher + Clone, M: Map<'a, K, (), S, A>, A: Allocator>
+    Iter<'a, K, S, A, M>
+{
+    pub(crate) fn new(inner: crate::iter::Iter<'a, K, (), S, A, M>) -> Self {
         Self { inner }
     }
 }
 
-impl<'a, K: Eq + Hash, S: 'a + BuildHasher + Clone, M: Map<'a, K, (), S>> Iterator
-    for Iter<'a, K, S, M>
+impl<'a, K: Eq + Hash, S: 'a + BuildHasher + Clone, M: Map<'a, K, (), S, Global>> Iterator
+    for Iter<'a, K, S, Global, M>
 {
     type Item = RefMulti<'a, K>;
 

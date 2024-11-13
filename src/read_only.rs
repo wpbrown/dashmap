@@ -1,6 +1,7 @@
 use crate::lock::RwLock;
 use crate::t::Map;
 use crate::{DashMap, HashMap};
+use allocator_api2::alloc::{Allocator, Global};
 use cfg_if::cfg_if;
 use core::borrow::Borrow;
 use core::fmt;
@@ -9,8 +10,8 @@ use crossbeam_utils::CachePadded;
 use std::collections::hash_map::RandomState;
 
 /// A read-only view into a `DashMap`. Allows to obtain raw references to the stored values.
-pub struct ReadOnlyView<K, V, S = RandomState> {
-    pub(crate) map: DashMap<K, V, S>,
+pub struct ReadOnlyView<K, V, S = RandomState, A: Allocator = Global> {
+    pub(crate) map: DashMap<K, V, S, A>,
 }
 
 impl<K: Eq + Hash + Clone, V: Clone, S: Clone> Clone for ReadOnlyView<K, V, S> {
@@ -29,18 +30,18 @@ impl<K: Eq + Hash + fmt::Debug, V: fmt::Debug, S: BuildHasher + Clone> fmt::Debu
     }
 }
 
-impl<K, V, S> ReadOnlyView<K, V, S> {
-    pub(crate) fn new(map: DashMap<K, V, S>) -> Self {
+impl<K, V, S, A: Allocator> ReadOnlyView<K, V, S, A> {
+    pub(crate) fn new(map: DashMap<K, V, S, A>) -> Self {
         Self { map }
     }
 
     /// Consumes this `ReadOnlyView`, returning the underlying `DashMap`.
-    pub fn into_inner(self) -> DashMap<K, V, S> {
+    pub fn into_inner(self) -> DashMap<K, V, S, A> {
         self.map
     }
 }
 
-impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> ReadOnlyView<K, V, S> {
+impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, A: Allocator> ReadOnlyView<K, V, S, A> {
     /// Returns the number of elements in the map.
     pub fn len(&self) -> usize {
         self.map.len()
@@ -130,12 +131,12 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone> ReadOnlyView<K, V, S>
             /// let map = DashMap::<(), ()>::new().into_read_only();
             /// println!("Amount of shards: {}", map.shards().len());
             /// ```
-            pub fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V>>>] {
+            pub fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V, A>>>] {
                 &self.map.shards
             }
         } else {
             #[allow(dead_code)]
-            pub(crate) fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V>>>] {
+            pub(crate) fn shards(&self) -> &[CachePadded<RwLock<HashMap<K, V, A>>>] {
                 &self.map.shards
             }
         }

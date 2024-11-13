@@ -79,7 +79,7 @@ where
 }
 
 pub struct OwningIter<K, V> {
-    pub(super) shards: Box<[CachePadded<RwLock<HashMap<K, V>>>]>,
+    pub(super) shards: Box<[CachePadded<RwLock<HashMap<K, V, A>>>]>,
 }
 
 impl<K, V> ParallelIterator for OwningIter<K, V>
@@ -124,7 +124,7 @@ where
 }
 
 pub struct Iter<'a, K, V> {
-    pub(super) shards: &'a [CachePadded<RwLock<HashMap<K, V>>>],
+    pub(super) shards: &'a [CachePadded<RwLock<HashMap<K, V, A>>>],
 }
 
 impl<'a, K, V> ParallelIterator for Iter<'a, K, V>
@@ -182,7 +182,7 @@ where
 }
 
 pub struct IterMut<'a, K, V> {
-    shards: &'a [CachePadded<RwLock<HashMap<K, V>>>],
+    shards: &'a [CachePadded<RwLock<HashMap<K, V, A>>>],
 }
 
 impl<'a, K, V> ParallelIterator for IterMut<'a, K, V>

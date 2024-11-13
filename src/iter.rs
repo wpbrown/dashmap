@@ -1,3 +1,5 @@
+use allocator_api2::alloc::{Allocator, Global};
+
 use super::mapref::multiple::{RefMulti, RefMutMulti};
 use crate::lock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::t::Map;
@@ -88,13 +90,13 @@ where
 {
 }
 
-type GuardIter<'a, K, V> = (
-    Arc<RwLockReadGuard<'a, HashMap<K, V>>>,
+type GuardIter<'a, K, V, A> = (
+    Arc<RwLockReadGuard<'a, HashMap<K, V, A>>>,
     hashbrown::raw::RawIter<(K, SharedValue<V>)>,
 );
 
-type GuardIterMut<'a, K, V> = (
-    Arc<RwLockWriteGuard<'a, HashMap<K, V>>>,
+type GuardIterMut<'a, K, V, A> = (
+    Arc<RwLockWriteGuard<'a, HashMap<K, V, A>>>,
     hashbrown::raw::RawIter<(K, SharedValue<V>)>,
 );
 
@@ -109,38 +111,42 @@ type GuardIterMut<'a, K, V> = (
 /// map.insert("hello", "world");
 /// assert_eq!(map.iter().count(), 1);
 /// ```
-pub struct Iter<'a, K, V, S = RandomState, M = DashMap<K, V, S>> {
+pub struct Iter<'a, K, V, S = RandomState, A: Allocator = Global, M = DashMap<K, V, S, A>> {
     map: &'a M,
     shard_i: usize,
-    current: Option<GuardIter<'a, K, V>>,
+    current: Option<GuardIter<'a, K, V, A>>,
     marker: PhantomData<S>,
 }
 
-impl<'i, K: Clone + Hash + Eq, V: Clone, S: Clone + BuildHasher> Clone for Iter<'i, K, V, S> {
+impl<'i, K: Clone + Hash + Eq, V: Clone, S: Clone + BuildHasher, A: Allocator> Clone
+    for Iter<'i, K, V, S, A>
+{
     fn clone(&self) -> Self {
         Iter::new(self.map)
     }
 }
 
-unsafe impl<'a, 'i, K, V, S, M> Send for Iter<'i, K, V, S, M>
+unsafe impl<'a, 'i, K, V, S, M, A: Allocator> Send for Iter<'i, K, V, S, A, M>
 where
     K: 'a + Eq + Hash + Send,
     V: 'a + Send,
     S: 'a + BuildHasher + Clone,
-    M: Map<'a, K, V, S>,
+    M: Map<'a, K, V, S, A>,
 {
 }
 
-unsafe impl<'a, 'i, K, V, S, M> Sync for Iter<'i, K, V, S, M>
+unsafe impl<'a, 'i, K, V, S, M, A: Allocator> Sync for Iter<'i, K, V, S, A, M>
 where
     K: 'a + Eq + Hash + Sync,
     V: 'a + Sync,
     S: 'a + BuildHasher + Clone,
-    M: Map<'a, K, V, S>,
+    M: Map<'a, K, V, S, A>,
 {
 }
 
-impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S>> Iter<'a, K, V, S, M> {
+impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S, A>, A: Allocator>
+    Iter<'a, K, V, S, A, M>
+{
     pub(crate) fn new(map: &'a M) -> Self {
         Self {
             map,
@@ -151,10 +157,10 @@ impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S>> Iter
     }
 }
 
-impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S>> Iterator
-    for Iter<'a, K, V, S, M>
+impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S, A>, A: Allocator>
+    Iterator for Iter<'a, K, V, S, A, M>
 {
-    type Item = RefMulti<'a, K, V>;
+    type Item = RefMulti<'a, K, V, A>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -195,33 +201,33 @@ impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S>> Iter
 /// map.iter_mut().for_each(|mut r| *r += 1);
 /// assert_eq!(*map.get("Johnny").unwrap(), 22);
 /// ```
-pub struct IterMut<'a, K, V, S = RandomState, M = DashMap<K, V, S>> {
+pub struct IterMut<'a, K, V, S = RandomState, A: Allocator = Global, M = DashMap<K, V, S, A>> {
     map: &'a M,
     shard_i: usize,
-    current: Option<GuardIterMut<'a, K, V>>,
+    current: Option<GuardIterMut<'a, K, V, A>>,
     marker: PhantomData<S>,
 }
 
-unsafe impl<'a, 'i, K, V, S, M> Send for IterMut<'i, K, V, S, M>
+unsafe impl<'a, 'i, K, V, S, M, A: Allocator> Send for IterMut<'i, K, V, S, A, M>
 where
     K: 'a + Eq + Hash + Send,
     V: 'a + Send,
     S: 'a + BuildHasher + Clone,
-    M: Map<'a, K, V, S>,
+    M: Map<'a, K, V, S, A>,
 {
 }
 
-unsafe impl<'a, 'i, K, V, S, M> Sync for IterMut<'i, K, V, S, M>
+unsafe impl<'a, 'i, K, V, S, M, A: Allocator> Sync for IterMut<'i, K, V, S, A, M>
 where
     K: 'a + Eq + Hash + Sync,
     V: 'a + Sync,
     S: 'a + BuildHasher + Clone,
-    M: Map<'a, K, V, S>,
+    M: Map<'a, K, V, S, A>,
 {
 }
 
-impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S>>
-    IterMut<'a, K, V, S, M>
+impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S, A>, A: Allocator>
+    IterMut<'a, K, V, S, A, M>
 {
     pub(crate) fn new(map: &'a M) -> Self {
         Self {
@@ -233,10 +239,10 @@ impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S>>
     }
 }
 
-impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S>> Iterator
-    for IterMut<'a, K, V, S, M>
+impl<'a, K: Eq + Hash, V, S: 'a + BuildHasher + Clone, M: Map<'a, K, V, S, A>, A: Allocator>
+    Iterator for IterMut<'a, K, V, S, A, M>
 {
-    type Item = RefMutMulti<'a, K, V>;
+    type Item = RefMutMulti<'a, K, V, A>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

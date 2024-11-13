@@ -265,7 +265,15 @@ impl<'a, K: 'a + Eq + Hash, S: BuildHasher + Clone> DashSet<K, S> {
     /// words.insert("hello");
     /// assert_eq!(words.iter().count(), 1);
     /// ```
-    pub fn iter(&'a self) -> Iter<'a, K, S, DashMap<K, (), S>> {
+    pub fn iter(
+        &'a self,
+    ) -> Iter<
+        'a,
+        K,
+        S,
+        allocator_api2::alloc::Global,
+        DashMap<K, (), S, allocator_api2::alloc::Global>,
+    > {
         let iter = self.inner.iter();
 
         Iter::new(iter)
