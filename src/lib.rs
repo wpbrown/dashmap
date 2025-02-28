@@ -928,7 +928,7 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: BuildHasher + Clone, A: Allocator> DashMap
     ///
     /// If the capacity overflows, or the allocator reports a failure, then an error is returned.
     // TODO: return std::collections::TryReserveError once std::collections::TryReserveErrorKind stabilises.
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+    pub fn try_reserve(&self, additional: usize) -> Result<(), TryReserveError> {
         for shard in self.shards.iter() {
             shard
                 .write()
